@@ -17,9 +17,9 @@ class SegmentationState extends Equatable {
     this.overlayImage,
     this.detectedBox, // <-- Added: [ymin, xmin, ymax, xmax] in [0.0, 1.0]
     this.isSegmenting = false,
-    this.similarityThreshold = 0.7,
+    this.similarityThreshold = 0.8,
     this.selectedInputSize = 320,
-    this.showLargestAreaOnly = false,
+    this.showLargestAreaOnly = true,
     this.showSlider = false,
     this.errorMessage,
   });
