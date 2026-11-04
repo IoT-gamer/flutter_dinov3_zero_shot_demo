@@ -32,19 +32,39 @@ class SegmentationCubit extends Cubit<SegmentationState> {
   int _latestWidth = 0;
   int _latestHeight = 0;
 
+  Future<String> _copyAssetToLocal(String assetFilename, Directory dir) async {
+    final file = File(p.join(dir.path, assetFilename));
+    if (!await file.exists()) {
+      final byteData = await rootBundle.load('assets/$assetFilename');
+      await file.writeAsBytes(byteData.buffer.asUint8List(), flush: true);
+    }
+    return file.path;
+  }
+
   Future<void> initialize() async {
     emit(state.copyWith(status: SegmentationStatus.loadingModel));
     _isolate = StatefulIsolate();
     try {
-      final byteData = await rootBundle.load(
-        'assets/${AppConstants.modelFilename}',
-      );
       final directory = await getApplicationDocumentsDirectory();
-      final modelPath = p.join(directory.path, AppConstants.modelFilename);
-      await File(modelPath).writeAsBytes(byteData.buffer.asUint8List());
+
+      final dinov3Path = await _copyAssetToLocal(
+        AppConstants.modelFilename,
+        directory,
+      );
+      final samEncoderPath = await _copyAssetToLocal(
+        AppConstants.samEncoderFilename,
+        directory,
+      );
+      final samDecoderPath = await _copyAssetToLocal(
+        AppConstants.samDecoderFilename,
+        directory,
+      );
+
       final token = RootIsolateToken.instance!;
       _isModelReady = await _isolate.compute(initializeSession, {
-        'path': modelPath,
+        'dinov3Path': dinov3Path,
+        'samEncoderPath': samEncoderPath,
+        'samDecoderPath': samDecoderPath,
         'token': token,
       });
       emit(state.copyWith(status: SegmentationStatus.modelReady));
@@ -52,7 +72,7 @@ class SegmentationCubit extends Cubit<SegmentationState> {
       emit(
         state.copyWith(
           status: SegmentationStatus.error,
-          errorMessage: 'Failed to initialize model: $e',
+          errorMessage: 'Failed to initialize models: $e',
         ),
       );
     }

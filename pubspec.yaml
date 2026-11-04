@@ -76,6 +76,8 @@ flutter:
   #   - images/a_dot_ham.jpeg
   assets:
     - assets/dinov3_feature_extractor.onnx
+    - assets/edgetam_encoder.onnx
+    - assets/edgetam_decoder.onnx
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

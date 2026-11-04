@@ -6,13 +6,17 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <algorithm>
 
 #include <android/log.h>
-#define LOG_TAG "DINOv3_Native"
+#define LOG_TAG "DINOv3_SAM_Native"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
 constexpr int PATCH_SIZE = 16;
+constexpr int SAM_INPUT_SIZE = 1024;
+constexpr int SAM_MASK_SIZE = 256;
+
 constexpr float MEAN_R = 0.485f * 255.0f;
 constexpr float MEAN_G = 0.456f * 255.0f;
 constexpr float MEAN_B = 0.406f * 255.0f;
@@ -21,9 +25,11 @@ constexpr float STD_G = 0.224f;
 constexpr float STD_B = 0.225f;
 
 Ort::Env* g_env = nullptr;
-Ort::Session* g_session = nullptr;
+Ort::Session* g_dinov3_session = nullptr;
+Ort::Session* g_sam_encoder_session = nullptr;
+Ort::Session* g_sam_decoder_session = nullptr;
 
-// Helper to preprocess RGB cv::Mat into normalized NCHW ONNX blob
+// Helper to preprocess RGB cv::Mat into normalized NCHW ONNX blob for DINOv3
 cv::Mat preprocess_image(const cv::Mat& rgb, int input_size, int& out_w_patches, int& out_h_patches) {
     int h_patches = input_size / PATCH_SIZE;
     int w_patches = (rgb.cols * input_size) / (rgb.rows * PATCH_SIZE);
@@ -35,38 +41,54 @@ cv::Mat preprocess_image(const cv::Mat& rgb, int input_size, int& out_w_patches,
     int new_w = w_patches * PATCH_SIZE;
     int new_h = h_patches * PATCH_SIZE;
 
-    // Resize image (bicubic interpolation)
     cv::Mat resized;
     cv::resize(rgb, resized, cv::Size(new_w, new_h), 0, 0, cv::INTER_CUBIC);
 
-    // Convert HWC uint8 -> NCHW float32 and subtract ImageNet mean
     cv::Mat blob = cv::dnn::blobFromImage(
         resized,
         1.0 / 255.0,
         cv::Size(new_w, new_h),
         cv::Scalar(MEAN_R, MEAN_G, MEAN_B),
-        false, // swapRB (already RGB)
-        false  // crop
+        false,
+        false
     );
 
-    // Fast vectorized channel-specific std division using OpenCV matrix views
     cv::Mat ch0(new_h, new_w, CV_32F, blob.ptr<float>(0, 0));
     ch0 /= STD_R;
-
     cv::Mat ch1(new_h, new_w, CV_32F, blob.ptr<float>(0, 1));
     ch1 /= STD_G;
-
     cv::Mat ch2(new_h, new_w, CV_32F, blob.ptr<float>(0, 2));
     ch2 /= STD_B;
 
     return blob;
 }
 
-// Runs inference on an NCHW blob and returns the output tensor
-std::vector<Ort::Value> run_inference(const cv::Mat& blob, int new_w, int new_h) {
+// Helper to preprocess RGB cv::Mat into 1024x1024 NCHW blob for EdgeTAM Encoder
+cv::Mat preprocess_sam_image(const cv::Mat& rgb) {
+    cv::Mat blob = cv::dnn::blobFromImage(
+        rgb,
+        1.0 / 255.0,
+        cv::Size(SAM_INPUT_SIZE, SAM_INPUT_SIZE),
+        cv::Scalar(MEAN_R, MEAN_G, MEAN_B),
+        false,
+        false
+    );
+
+    cv::Mat ch0(SAM_INPUT_SIZE, SAM_INPUT_SIZE, CV_32F, blob.ptr<float>(0, 0));
+    ch0 /= STD_R;
+    cv::Mat ch1(SAM_INPUT_SIZE, SAM_INPUT_SIZE, CV_32F, blob.ptr<float>(0, 1));
+    ch1 /= STD_G;
+    cv::Mat ch2(SAM_INPUT_SIZE, SAM_INPUT_SIZE, CV_32F, blob.ptr<float>(0, 2));
+    ch2 /= STD_B;
+
+    return blob;
+}
+
+// Runs DINOv3 inference on an NCHW blob
+std::vector<Ort::Value> run_dinov3_inference(const cv::Mat& blob, int new_w, int new_h) {
     Ort::AllocatorWithDefaultOptions allocator;
-    auto input_name_alloc = g_session->GetInputNameAllocated(0, allocator);
-    auto output_name_alloc = g_session->GetOutputNameAllocated(0, allocator);
+    auto input_name_alloc = g_dinov3_session->GetInputNameAllocated(0, allocator);
+    auto output_name_alloc = g_dinov3_session->GetOutputNameAllocated(0, allocator);
 
     const char* input_names[] = { input_name_alloc.get() };
     const char* output_names[] = { output_name_alloc.get() };
@@ -82,7 +104,7 @@ std::vector<Ort::Value> run_inference(const cv::Mat& blob, int new_w, int new_h)
         input_shape.size()
     );
 
-    return g_session->Run(
+    return g_dinov3_session->Run(
         Ort::RunOptions{nullptr},
         input_names,
         &input_tensor,
@@ -91,48 +113,181 @@ std::vector<Ort::Value> run_inference(const cv::Mat& blob, int new_w, int new_h)
         1
     );
 }
+
+// Runs EdgeTAM Encoder + Decoder using Gemma 4 normalized bounding box [ymin, xmin, ymax, xmax]
+// Returns a 256x256 binary mask (CV_8UC1, 255 = foreground, 0 = background)
+cv::Mat run_edgetam_box_segmentation(
+    const cv::Mat& rgb,
+    float ymin,
+    float xmin,
+    float ymax,
+    float xmax
+) {
+    if (!g_sam_encoder_session || !g_sam_decoder_session) {
+        return cv::Mat();
+    }
+
+    try {
+        auto memory_info = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
+
+        // 1. Run EdgeTAM Encoder
+        cv::Mat sam_blob = preprocess_sam_image(rgb);
+        std::vector<int64_t> enc_input_shape = {1, 3, SAM_INPUT_SIZE, SAM_INPUT_SIZE};
+        Ort::Value enc_input_tensor = Ort::Value::CreateTensor<float>(
+            memory_info,
+            reinterpret_cast<float*>(sam_blob.data),
+            sam_blob.total(),
+            enc_input_shape.data(),
+            enc_input_shape.size()
+        );
+
+        const char* enc_input_names[] = { "image" };
+        const char* enc_output_names[] = { "image_embed", "high_res_feats_0", "high_res_feats_1" };
+
+        auto enc_outputs = g_sam_encoder_session->Run(
+            Ort::RunOptions{nullptr},
+            enc_input_names,
+            &enc_input_tensor,
+            1,
+            enc_output_names,
+            3
+        );
+
+        // 2. Prepare EdgeTAM Decoder Box Prompt Inputs (labels 2.0 = top-left, 3.0 = bottom-right)
+        std::vector<float> point_coords = {
+            xmin * SAM_INPUT_SIZE, ymin * SAM_INPUT_SIZE,
+            xmax * SAM_INPUT_SIZE, ymax * SAM_INPUT_SIZE
+        };
+        std::vector<int64_t> coords_shape = {1, 2, 2};
+
+        std::vector<float> point_labels = { 2.0f, 3.0f };
+        std::vector<int64_t> labels_shape = {1, 2};
+
+        std::vector<float> empty_mask(1 * 1 * SAM_MASK_SIZE * SAM_MASK_SIZE, 0.0f);
+        std::vector<int64_t> mask_input_shape = {1, 1, SAM_MASK_SIZE, SAM_MASK_SIZE};
+
+        std::vector<float> no_mask_flag = { 0.0f };
+        std::vector<int64_t> flag_shape = {1};
+
+        std::vector<Ort::Value> dec_inputs;
+        dec_inputs.push_back(std::move(enc_outputs[0])); // image_embed
+        dec_inputs.push_back(std::move(enc_outputs[1])); // high_res_feats_0
+        dec_inputs.push_back(std::move(enc_outputs[2])); // high_res_feats_1
+        dec_inputs.push_back(Ort::Value::CreateTensor<float>(
+            memory_info, point_coords.data(), point_coords.size(),
+            coords_shape.data(), coords_shape.size()
+        ));
+        dec_inputs.push_back(Ort::Value::CreateTensor<float>(
+            memory_info, point_labels.data(), point_labels.size(),
+            labels_shape.data(), labels_shape.size()
+        ));
+        dec_inputs.push_back(Ort::Value::CreateTensor<float>(
+            memory_info, empty_mask.data(), empty_mask.size(),
+            mask_input_shape.data(), mask_input_shape.size()
+        ));
+        dec_inputs.push_back(Ort::Value::CreateTensor<float>(
+            memory_info, no_mask_flag.data(), no_mask_flag.size(),
+            flag_shape.data(), flag_shape.size()
+        ));
+
+        const char* dec_input_names[] = {
+            "image_embed",
+            "high_res_feats_0",
+            "high_res_feats_1",
+            "point_coords",
+            "point_labels",
+            "mask_input",
+            "has_mask_input"
+        };
+        const char* dec_output_names[] = { "low_res_masks", "iou_predictions" };
+
+        auto dec_outputs = g_sam_decoder_session->Run(
+            Ort::RunOptions{nullptr},
+            dec_input_names,
+            dec_inputs.data(),
+            dec_inputs.size(),
+            dec_output_names,
+            2
+        );
+
+        // 3. Select highest-IoU mask candidate
+        const float* masks_ptr = dec_outputs[0].GetTensorData<float>();
+        const float* iou_ptr = dec_outputs[1].GetTensorData<float>();
+        size_t num_masks = dec_outputs[1].GetTensorTypeAndShapeInfo().GetElementCount();
+
+        int best_mask_idx = 0;
+        for (size_t i = 1; i < num_masks; ++i) {
+            if (iou_ptr[i] > iou_ptr[best_mask_idx]) {
+                best_mask_idx = static_cast<int>(i);
+            }
+        }
+
+        // 4. Threshold logits > 0.0f into 256x256 binary mask
+        const int mask_area = SAM_MASK_SIZE * SAM_MASK_SIZE;
+        const float* best_mask_slice = masks_ptr + (best_mask_idx * mask_area);
+
+        cv::Mat binary_mask(SAM_MASK_SIZE, SAM_MASK_SIZE, CV_8UC1);
+        for (int i = 0; i < mask_area; ++i) {
+            binary_mask.data[i] = (best_mask_slice[i] > 0.0f) ? 255 : 0;
+        }
+
+        // 5. Morphological cleanup (fill holes & remove isolated islands)
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+        cv::morphologyEx(binary_mask, binary_mask, cv::MORPH_CLOSE, kernel);
+        cv::morphologyEx(binary_mask, binary_mask, cv::MORPH_OPEN, kernel);
+
+        return binary_mask;
+    } catch (const Ort::Exception& e) {
+        LOGE("EdgeTAM ONNX Exception: %s", e.what());
+        return cv::Mat();
+    }
+}
 } // namespace
 
 extern "C" {
 
 __attribute__((visibility("default"))) __attribute__((used))
-void init_session(const char* model_path) {
+void init_session(
+    const char* dinov3_model_path,
+    const char* sam_encoder_path,
+    const char* sam_decoder_path
+) {
     try {
-        if (g_session != nullptr) {
-            delete g_session;
-            g_session = nullptr;
-        }
-        if (g_env != nullptr) {
-            delete g_env;
-            g_env = nullptr;
-        }
+        delete g_dinov3_session; g_dinov3_session = nullptr;
+        delete g_sam_encoder_session; g_sam_encoder_session = nullptr;
+        delete g_sam_decoder_session; g_sam_decoder_session = nullptr;
+        delete g_env; g_env = nullptr;
 
-        g_env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "DINOv3_Native");
-        Ort::SessionOptions session_options;
-        session_options.SetIntraOpNumThreads(4);
+        g_env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "DINOv3_SAM_Native");
 
+        // DINOv3 Session (with NNAPI acceleration for real-time frame loop)
+        Ort::SessionOptions dino_options;
+        dino_options.SetIntraOpNumThreads(4);
         #if defined(__ANDROID__)
-        // If NNAPI fails or is unsupported on this device/chipset, log and continue with CPU
-        OrtStatus* status = OrtSessionOptionsAppendExecutionProvider_Nnapi((OrtSessionOptions*)session_options, 0);
+        OrtStatus* status = OrtSessionOptionsAppendExecutionProvider_Nnapi((OrtSessionOptions*)dino_options, 0);
         if (status != nullptr) {
-            const auto& api = Ort::GetApi();
-            LOGE("NNAPI Provider registration failed: %s", api.GetErrorMessage(status));
-            api.ReleaseStatus(status);
+            Ort::GetApi().ReleaseStatus(status);
         }
         #endif
+        g_dinov3_session = new Ort::Session(*g_env, dinov3_model_path, dino_options);
 
-        g_session = new Ort::Session(*g_env, model_path, session_options);
-        LOGE("Session successfully created for model: %s", model_path);
-    } catch (const Ort::Exception& e) {
-        LOGE("ONNX Runtime Exception in init_session: %s", e.what());
+        // EdgeTAM Encoder & Decoder Sessions (CPU 4-thread to avoid GPU contention with Gemma 4)
+        Ort::SessionOptions sam_options;
+        sam_options.SetIntraOpNumThreads(4);
+        sam_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+        g_sam_encoder_session = new Ort::Session(*g_env, sam_encoder_path, sam_options);
+        g_sam_decoder_session = new Ort::Session(*g_env, sam_decoder_path, sam_options);
+
+        LOGE("Initialized DINOv3 + EdgeTAM Encoder & Decoder sessions.");
     } catch (const std::exception& e) {
-        LOGE("Standard Exception in init_session: %s", e.what());
+        LOGE("Exception in init_session: %s", e.what());
     }
 }
 
 __attribute__((visibility("default"))) __attribute__((used))
 float* create_prototype(uint8_t* rgba_data, int length, int input_size, int* out_feature_dim) {
-    if (!g_session || !rgba_data || length <= 0) {
+    if (!g_dinov3_session || !rgba_data || length <= 0) {
         *out_feature_dim = 0;
         return nullptr;
     }
@@ -163,7 +318,7 @@ float* create_prototype(uint8_t* rgba_data, int length, int input_size, int* out
     cv::resize(mask, resized_mask, cv::Size(w_patches, h_patches), 0, 0, cv::INTER_NEAREST);
 
     // Run ONNX inference
-    auto output_tensors = run_inference(blob, new_w, new_h);
+    auto output_tensors = run_dinov3_inference(blob, new_w, new_h);
     const float* all_features = output_tensors.front().GetTensorData<float>();
     size_t total_elements = output_tensors.front().GetTensorTypeAndShapeInfo().GetElementCount();
 
@@ -214,7 +369,7 @@ float* run_segmentation(
     int* out_w,
     int* out_h
 ) {
-    if (!g_session || !yuv_data || !prototype) {
+    if (!g_dinov3_session || !yuv_data || !prototype) {
         *out_w = 0;
         *out_h = 0;
         return nullptr;
@@ -235,7 +390,7 @@ float* run_segmentation(
     int num_patches = w_patches * h_patches;
 
     // Run ONNX Inference
-    auto output_tensors = run_inference(blob, w_patches * PATCH_SIZE, h_patches * PATCH_SIZE);
+    auto output_tensors = run_dinov3_inference(blob, w_patches * PATCH_SIZE, h_patches * PATCH_SIZE);
     const float* test_features = output_tensors.front().GetTensorData<float>();
 
     // Compute Cosine Similarity between reference prototype and each patch
@@ -351,89 +506,44 @@ float* create_prototype_from_box(
     int input_size,
     int* out_feature_dim
 ) {
-    if (!g_session || !yuv_data) {
+    if (!g_dinov3_session || !yuv_data) {
         *out_feature_dim = 0;
         return nullptr;
     }
 
-    // Convert YUV420 to RGB and rotate 90 degrees clockwise to match portrait camera
+    // 1. Convert YUV420 to RGB and rotate 90 degrees clockwise to match portrait camera
     cv::Mat yuv(height * 3 / 2, width, CV_8UC1, yuv_data);
     cv::Mat rgb, rotated;
     cv::cvtColor(yuv, rgb, cv::COLOR_YUV2RGB_I420);
     cv::rotate(rgb, rotated, cv::ROTATE_90_CLOCKWISE);
 
-    // Preprocess and run DINOv3 ONNX inference
+    // 2. Run DINOv3 feature extraction on the rotated frame
     int w_patches = 0, h_patches = 0;
     cv::Mat blob = preprocess_image(rotated, input_size, w_patches, h_patches);
     int new_w = w_patches * PATCH_SIZE;
     int new_h = h_patches * PATCH_SIZE;
 
-    auto output_tensors = run_inference(blob, new_w, new_h);
+    auto output_tensors = run_dinov3_inference(blob, new_w, new_h);
     const float* all_features = output_tensors.front().GetTensorData<float>();
     size_t total_elements = output_tensors.front().GetTensorTypeAndShapeInfo().GetElementCount();
 
     int num_patches = w_patches * h_patches;
     int feature_dim = static_cast<int>(total_elements / num_patches);
 
-    // Map normalized [0.0, 1.0] box coordinates to DINOv3 patch grid
-    int x0 = std::clamp(static_cast<int>(std::floor(xmin * w_patches)), 0, w_patches - 1);
-    int x1 = std::clamp(static_cast<int>(std::ceil(xmax * w_patches)) - 1, x0, w_patches - 1);
-    int y0 = std::clamp(static_cast<int>(std::floor(ymin * h_patches)), 0, h_patches - 1);
-    int y1 = std::clamp(static_cast<int>(std::ceil(ymax * h_patches)) - 1, y0, h_patches - 1);
+    // 3. Run EdgeTAM box-prompted segmentation using Gemma 4's bounding box
+    cv::Mat sam_mask_256 = run_edgetam_box_segmentation(rotated, ymin, xmin, ymax, xmax);
 
-    // Step 1 of Refinement: Average the inner 36% core to form a pure foreground seed
-    int box_w = x1 - x0 + 1;
-    int box_h = y1 - y0 + 1;
-    int margin_x = static_cast<int>(box_w * 0.32f);
-    int margin_y = static_cast<int>(box_h * 0.32f);
-
-    int core_x0 = std::min(x0 + margin_x, x1);
-    int core_x1 = std::max(x1 - margin_x, core_x0);
-    int core_y0 = std::min(y0 + margin_y, y1);
-    int core_y1 = std::max(y1 - margin_y, core_y0);
-
-    std::vector<float> seed_proto(feature_dim, 0.0f);
-    int seed_count = 0;
-
-    for (int y = core_y0; y <= core_y1; ++y) {
-        for (int x = core_x0; x <= core_x1; ++x) {
-            const float* patch_feat = all_features + ((y * w_patches + x) * feature_dim);
-            for (int d = 0; d < feature_dim; ++d) {
-                seed_proto[d] += patch_feat[d];
-            }
-            seed_count++;
-        }
-    }
-
-    float seed_mag = 0.0f;
-    for (int d = 0; d < feature_dim; ++d) {
-        seed_proto[d] /= static_cast<float>(std::max(1, seed_count));
-        seed_mag += seed_proto[d] * seed_proto[d];
-    }
-    seed_mag = std::sqrt(seed_mag);
-
-    // Step 2 of Refinement: Filter all patches inside the bounding box against the seed
     std::vector<float> final_proto(feature_dim, 0.0f);
     int fg_count = 0;
-    constexpr float SEED_SIM_THRESHOLD = 0.60f;
 
-    for (int y = y0; y <= y1; ++y) {
-        for (int x = x0; x <= x1; ++x) {
-            const float* patch_feat = all_features + ((y * w_patches + x) * feature_dim);
-            float dot = 0.0f;
-            float patch_mag = 0.0f;
+    if (!sam_mask_256.empty()) {
+        // Downscale 256x256 EdgeTAM mask to DINOv3 patch grid (w_patches x h_patches)
+        cv::Mat patch_mask;
+        cv::resize(sam_mask_256, patch_mask, cv::Size(w_patches, h_patches), 0, 0, cv::INTER_NEAREST);
 
-            for (int d = 0; d < feature_dim; ++d) {
-                dot += patch_feat[d] * seed_proto[d];
-                patch_mag += patch_feat[d] * patch_feat[d];
-            }
-            patch_mag = std::sqrt(patch_mag);
-
-            float sim = (seed_mag > 0.0f && patch_mag > 0.0f)
-                ? (dot / (seed_mag * patch_mag))
-                : 0.0f;
-
-            if (sim >= SEED_SIM_THRESHOLD) {
+        for (int i = 0; i < num_patches; ++i) {
+            if (patch_mask.data[i] > 127) {
+                const float* patch_feat = all_features + (i * feature_dim);
                 for (int d = 0; d < feature_dim; ++d) {
                     final_proto[d] += patch_feat[d];
                 }
@@ -442,14 +552,31 @@ float* create_prototype_from_box(
         }
     }
 
-    // Fallback to seed_proto if threshold filtered everything out (e.g. tiny 1-patch box)
+    // 4. Fallback: If EdgeTAM produced an empty mask after downscaling, pool inner box patches
     if (fg_count == 0) {
-        final_proto = seed_proto;
-        fg_count = 1;
-    } else {
-        for (int d = 0; d < feature_dim; ++d) {
-            final_proto[d] /= static_cast<float>(fg_count);
+        int x0 = std::clamp(static_cast<int>(std::floor(xmin * w_patches)), 0, w_patches - 1);
+        int x1 = std::clamp(static_cast<int>(std::ceil(xmax * w_patches)) - 1, x0, w_patches - 1);
+        int y0 = std::clamp(static_cast<int>(std::floor(ymin * h_patches)), 0, h_patches - 1);
+        int y1 = std::clamp(static_cast<int>(std::ceil(ymax * h_patches)) - 1, y0, h_patches - 1);
+
+        for (int y = y0; y <= y1; ++y) {
+            for (int x = x0; x <= x1; ++x) {
+                const float* patch_feat = all_features + ((y * w_patches + x) * feature_dim);
+                for (int d = 0; d < feature_dim; ++d) {
+                    final_proto[d] += patch_feat[d];
+                }
+                fg_count++;
+            }
         }
+    }
+
+    if (fg_count == 0) {
+        *out_feature_dim = 0;
+        return nullptr;
+    }
+
+    for (int d = 0; d < feature_dim; ++d) {
+        final_proto[d] /= static_cast<float>(fg_count);
     }
 
     float* result = new float[feature_dim];

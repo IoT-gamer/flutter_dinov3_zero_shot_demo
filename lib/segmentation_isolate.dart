@@ -8,9 +8,17 @@ import 'package:flutter/services.dart';
 
 // --- FFI Type Definitions ---
 
-// init_session(const char* model_path)
-typedef InitSessionC = Void Function(Pointer<Utf8> modelPath);
-typedef InitSessionDart = void Function(Pointer<Utf8> modelPath);
+// init_session(const char* dinov3_path, const char* sam_encoder_path, const char* sam_decoder_path)
+typedef InitSessionC = Void Function(
+  Pointer<Utf8> dinov3Path,
+  Pointer<Utf8> samEncoderPath,
+  Pointer<Utf8> samDecoderPath,
+);
+typedef InitSessionDart = void Function(
+  Pointer<Utf8> dinov3Path,
+  Pointer<Utf8> samEncoderPath,
+  Pointer<Utf8> samDecoderPath,
+);
 
 // create_prototype(uint8_t* rgba_data, int length, int input_size, int* out_feature_dim)
 typedef CreatePrototypeC = Pointer<Float> Function(
@@ -120,19 +128,22 @@ final createPrototypeFromBoxNative = nativeLib
 
 // --- Isolate Functions ---
 
-/// Returns a boolean indicating success since we no longer pass the OrtSession across the isolate.
+/// Returns a boolean indicating success.
 Future<bool> initializeSession(Map<String, dynamic> args) async {
   BackgroundIsolateBinaryMessenger.ensureInitialized(
     args['token'] as RootIsolateToken,
   );
 
-  final String modelPath = args['path'];
-  final pathPointer = modelPath.toNativeUtf8();
+  final dinoPtr = (args['dinov3Path'] as String).toNativeUtf8();
+  final encPtr = (args['samEncoderPath'] as String).toNativeUtf8();
+  final decPtr = (args['samDecoderPath'] as String).toNativeUtf8();
 
-  initSessionNative(pathPointer);
-  malloc.free(pathPointer);
+  initSessionNative(dinoPtr, encPtr, decPtr);
 
-  print('✅ Native C++ ONNX Session Initialized in Isolate.');
+  malloc.free(dinoPtr);
+  malloc.free(encPtr);
+  malloc.free(decPtr);
+
   return true;
 }
 
