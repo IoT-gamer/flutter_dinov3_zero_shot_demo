@@ -2,7 +2,7 @@
 
 > ⚠️ **Platform Notice:** Currently, only **Android** is supported. This application uses a hybrid native architecture combining Android JNI (`LiteRT-LM`) and C++ FFI (`ONNX Runtime` + `OpenCV`).
 
-A Flutter Edge AI application demonstrating **on-device, zero-shot multimodal object segmentation and real-time tracking**. By combining **Gemma 4 (`gemma-4-E2B-it.litertlm`)** via Google's LiteRT-LM with **EdgeTAM (Segment Anything)** and **DINOv3** via ONNX Runtime and OpenCV in C++, users can simply **speak** or **type** the name of any object in the camera view to automatically ground, segment, and track it in real time—with zero cloud dependencies.
+A Flutter Edge AI application demonstrating **on-device, zero-shot multimodal object segmentation and real-time tracking**. By combining **Gemma 4 (`gemma-4-E2B-it.litertlm`)** via Google's LiteRT-LM with **EdgeTAM (Segment Anything)** and **DINOv3** via ONNX Runtime and OpenCV in C++, users can simply **speak** or **type** the name of any object in the camera view to automatically ground, segment, export, and track it in real time—with zero cloud dependencies.
 
 ---
 
@@ -25,8 +25,9 @@ This repository implements a **Slow-Fast Visual Pipeline** that partitions workl
 
 * **Zero-Shot Voice & Text Enrollment:** Point the camera at an object and say *"coffee mug"* (via a 5-second $16\text{ kHz}$ mono WAV recording) or type a description. No pre-cut images required.
 * **EdgeTAM Box-Prompted Prototype Extraction:** Uses Gemma 4's detected bounding box (`[ymin, xmin, ymax, xmax]`) as a box prompt for EdgeTAM in C++ (`1024x1024` input) to generate a precise foreground mask, automatically selecting the highest-IoU candidate and running OpenCV morphological closing/opening before pooling DINOv3 patch embeddings.
+* **Transparent RGBA PNG Cutout Export:** Save any Gemma 4 + EdgeTAM segmented object directly to your device gallery as a 4-channel transparent RGBA PNG (`gal`). Preserves straight (unpremultiplied) RGB scene context under transparent pixels so re-importing the PNG later maintains full Vision Transformer self-attention consistency and high similarity thresholds.
 * **Fallback 1-Shot Gallery Enrollment:** Support for uploading a pre-masked RGBA PNG with transparency from the device gallery.
-* **Zero-Copy Native Camera Pipeline:** Raw `YUV420` camera planes are passed directly to C++ via FFI for OpenCV SIMD rotation, normalization, and ONNX inference inside a background `StatefulIsolate`.
+* **Stride-Aware Native Camera Pipeline:** De-interleaves Android `YUV_420_888` (`NV21`/`NV12`) chroma planes using `bytesPerRow` and `bytesPerPixel` into contiguous planar `I420` buffers before passing to C++ via FFI for accurate OpenCV RGB conversion, rotation, and ONNX inference inside a background `StatefulIsolate`.
 * **Multi-Token Prediction (MTP):** Enables experimental speculative decoding on the LiteRT-LM GPU backend for fast Gemma 4 coordinate generation.
 * **Interactive Controls:**
   * Live **Cosine Similarity Threshold Slider** (`0.50` – `0.90`).
@@ -43,14 +44,14 @@ android/
   └── app/src/main/
       ├── cpp/
       │   ├── CMakeLists.txt           # Fetches ONNX Runtime 1.30.0 & OpenCV 5.0.0 SDK
-      │   └── native_segmentation.cpp  # DINOv3 + EdgeTAM inference, mask pooling & YUV-to-JPEG
+      │   └── native_segmentation.cpp  # DINOv3 + EdgeTAM inference, RGBA PNG export & YUV-to-JPEG
       └── kotlin/.../
           ├── LitertBridge.kt          # Native LiteRT-LM wrapper (Vision, Audio & Grounding)
           └── MainActivity.kt          # Flutter entry point
 lib/
   ├── cubit/
-  │   ├── segmentation_cubit.dart      # State management orchestrating Gemma 4, EdgeTAM & DINOv3
-  │   └── segmentation_state.dart      # Immutable state (prototype, overlay mask, bounding box)
+  │   ├── segmentation_cubit.dart      # State management orchestrating Gemma 4, EdgeTAM, DINOv3 & Gallery export
+  │   └── segmentation_state.dart      # Immutable state (prototype, overlay mask, bounding box, cutout path)
   ├── src/generated/
   │   └── litertlm_bindings.dart       # Auto-generated JNI bindings (via jnigen)
   ├── audio_recorder_service.dart      # 16kHz mono PCM WAV recorder for LiteRT-LM audio
@@ -58,7 +59,7 @@ lib/
   ├── constants.dart                   # DINOv3 and EdgeTAM model asset constants
   ├── inference_service.dart           # Memory-safe Dart wrapper around JNI LitertBridge
   ├── main.dart                        # App entry, camera setup & LiteRT-LM initialization
-  └── segmentation_isolate.dart        # Dart FFI bindings & background isolate workers
+  └── segmentation_isolate.dart        # Dart FFI bindings, stride-aware I420 packing & background isolate workers
 tool/
   └── jnigen.dart                      # JNI binding generator script
 ```
@@ -132,10 +133,10 @@ Restart the app—Gemma 4 will load into GPU memory and both DINOv3 and EdgeTAM 
    * OpenCV saves a $700\text{ px}$ snapshot (**280 Token Budget**) of the current camera frame.
    * Gemma 4 returns the bounding box `[ymin, xmin, ymax, xmax]`.
    * C++ feeds the bounding box into **EdgeTAM (`edgetam_encoder.onnx` + `edgetam_decoder.onnx`)** to generate a clean $256 \times 256$ binary object mask, pools the corresponding **DINOv3** foreground patch features into a prototype vector, and automatically starts real-time tracking!
-
+5. **Export Cutout (Optional):** Tap the teal **Save Cutout** (`Icons.save_alt`) floating action button to export the segmented object as a transparent RGBA PNG to your device's photo gallery.
 ### Method B: One-Shot RGBA PNG Enrollment (Fallback)
 1. Tap the **Upload File** floating action button.
-2. Select a 4-channel RGBA PNG with a transparent background from your gallery (you can use [flutter_segment_anything_app](https://github.com/IoT-gamer/flutter_segment_anything_app) to generate masks).
+2. Select a 4-channel RGBA PNG with a transparent background from your gallery (either exported directly from this app or created with [flutter_segment_anything_app](https://github.com/IoT-gamer/flutter_segment_anything_app) to generate masks).
 3. Tap the **Play** button to start real-time segmentation.
 
 ### Fine-Tuning Tracking Performance

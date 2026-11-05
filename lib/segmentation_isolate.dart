@@ -88,8 +88,10 @@ typedef CreatePrototypeFromBoxC = Pointer<Float> Function(
   Float ymax,
   Float xmax,
   Int32 inputSize,
+  Pointer<Utf8> outCutoutPngPath,
   Pointer<Int32> outFeatureDim,
 );
+
 typedef CreatePrototypeFromBoxDart = Pointer<Float> Function(
   Pointer<Uint8> yuvData,
   int width,
@@ -99,6 +101,7 @@ typedef CreatePrototypeFromBoxDart = Pointer<Float> Function(
   double ymax,
   double xmax,
   int inputSize,
+  Pointer<Utf8> outCutoutPngPath,
   Pointer<Int32> outFeatureDim,
 );
 
@@ -147,28 +150,67 @@ Future<bool> initializeSession(Map<String, dynamic> args) async {
   return true;
 }
 
-// Helper to pack CameraImage YUV420 planes into contiguous I420 buffer
-Pointer<Uint8> _packYuvPlanes(List<Uint8List> planes, int width, int height) {
-  final int yuvSize = width * height * 3 ~/ 2;
-  final Pointer<Uint8> yuvPointer = malloc.allocate<Uint8>(yuvSize);
-  final yuvList = yuvPointer.asTypedList(yuvSize);
-
+// Helper to pack CameraImage YUV420 planes into a contiguous planar I420 buffer
+Pointer<Uint8> _packYuvPlanes(
+  List<Uint8List> planes,
+  int width,
+  int height, {
+  List<int>? bytesPerRow,
+  List<int?>? bytesPerPixel,
+}) {
   final int ySize = width * height;
-  final int uvSize = ySize ~/ 4;
+  final int uvWidth = width ~/ 2;
+  final int uvHeight = height ~/ 2;
+  final int uvSize = uvWidth * uvHeight;
+  final int yuvSize = ySize + (uvSize * 2);
 
-  yuvList.setRange(0, ySize, planes[0]);
-  final uPlane = planes[1];
-  yuvList.setRange(
-    ySize,
-    ySize + uvSize,
-    uPlane.length >= uvSize ? uPlane.sublist(0, uvSize) : uPlane,
-  );
-  final vPlane = planes[2];
-  yuvList.setRange(
-    ySize + uvSize,
-    yuvSize,
-    vPlane.length >= uvSize ? vPlane.sublist(0, uvSize) : vPlane,
-  );
+  final Pointer<Uint8> yuvPointer = malloc.allocate<Uint8>(yuvSize);
+  final Uint8List yuvList = yuvPointer.asTypedList(yuvSize);
+
+  final Uint8List yPlane = planes[0];
+  final Uint8List uPlane = planes[1];
+  final Uint8List vPlane = planes[2];
+
+  final int yRowStride = (bytesPerRow != null && bytesPerRow.isNotEmpty)
+      ? bytesPerRow[0]
+      : width;
+  final int uvPixelStride = (bytesPerPixel != null && bytesPerPixel.length > 1)
+      ? (bytesPerPixel[1] ?? 1)
+      : (uPlane.length > uvSize ? 2 : 1);
+  final int uvRowStride = (bytesPerRow != null && bytesPerRow.length > 1)
+      ? bytesPerRow[1]
+      : (uvPixelStride == 2 ? width : uvWidth);
+
+  // Copy Y plane (stripping any row padding)
+  if (yRowStride == width && yPlane.length >= ySize) {
+    yuvList.setRange(0, ySize, yPlane);
+  } else {
+    int dstY = 0;
+    for (int row = 0; row < height; row++) {
+      final int srcY = row * yRowStride;
+      yuvList.setRange(dstY, dstY + width, yPlane, srcY);
+      dstY += width;
+    }
+  }
+
+  // Copy & de-interleave U and V planes into planar I420
+  int dstU = ySize;
+  int dstV = ySize + uvSize;
+
+  if (uvPixelStride == 1 && uvRowStride == uvWidth) {
+    yuvList.setRange(dstU, dstU + uvSize, uPlane);
+    yuvList.setRange(dstV, dstV + uvSize, vPlane);
+  } else {
+    for (int row = 0; row < uvHeight; row++) {
+      final int rowStart = row * uvRowStride;
+      for (int col = 0; col < uvWidth; col++) {
+        final int uvIndex = rowStart + (col * uvPixelStride);
+        yuvList[dstU++] = uPlane[uvIndex];
+        yuvList[dstV++] = vPlane[uvIndex];
+      }
+    }
+  }
+
   return yuvPointer;
 }
 
@@ -180,7 +222,13 @@ Future<bool> saveFrameForGemma(Map<String, dynamic> args) async {
   final int maxDim = args['maxDim'] ?? 700; // 700px = 280 Token Budget
   final String outPath = args['outPath'];
 
-  final yuvPointer = _packYuvPlanes(planes, width, height);
+  final yuvPointer = _packYuvPlanes(
+    planes,
+    width,
+    height,
+    bytesPerRow: (args['bytesPerRow'] as List?)?.cast<int>(),
+    bytesPerPixel: (args['bytesPerPixel'] as List?)?.cast<int?>(),
+  );
   final pathPointer = outPath.toNativeUtf8();
 
   final success = saveYuvForGemmaNative(
@@ -201,11 +249,18 @@ Future<List<double>> createPrototypeFromBox(Map<String, dynamic> args) async {
   final List<Uint8List> planes = args['planes'];
   final int width = args['width'];
   final int height = args['height'];
-  final List<double> box =
-      args['box']; // [ymin, xmin, ymax, xmax] in [0.0, 1.0]
+  final List<double> box = args['box'];
   final int inputSize = args['inputSize'];
+  final String cutoutPath = args['cutoutPath'] ?? '';
 
-  final yuvPointer = _packYuvPlanes(planes, width, height);
+  final yuvPointer = _packYuvPlanes(
+    planes,
+    width,
+    height,
+    bytesPerRow: (args['bytesPerRow'] as List?)?.cast<int>(),
+    bytesPerPixel: (args['bytesPerPixel'] as List?)?.cast<int?>(),
+  );
+  final cutoutPathPointer = cutoutPath.toNativeUtf8();
   final outDimPointer = malloc.allocate<Int32>(sizeOf<Int32>());
 
   final Pointer<Float> prototypePointer = createPrototypeFromBoxNative(
@@ -217,6 +272,7 @@ Future<List<double>> createPrototypeFromBox(Map<String, dynamic> args) async {
     box[2],
     box[3],
     inputSize,
+    cutoutPathPointer,
     outDimPointer,
   );
 
@@ -229,6 +285,7 @@ Future<List<double>> createPrototypeFromBox(Map<String, dynamic> args) async {
   }
 
   malloc.free(yuvPointer);
+  malloc.free(cutoutPathPointer);
   malloc.free(outDimPointer);
   return objectPrototype;
 }
@@ -286,7 +343,13 @@ Future<Map<String, dynamic>> runSegmentation(Map<String, dynamic> args) async {
 
   // Correctly assemble YUV planes to match exact height * 1.5 * width I420 size
   final int yuvSize = width * height * 3 ~/ 2;
-  final Pointer<Uint8> yuvPointer = malloc.allocate<Uint8>(yuvSize);
+  final yuvPointer = _packYuvPlanes(
+    planes,
+    width,
+    height,
+    bytesPerRow: (args['bytesPerRow'] as List?)?.cast<int>(),
+    bytesPerPixel: (args['bytesPerPixel'] as List?)?.cast<int?>(),
+  );
   final yuvList = yuvPointer.asTypedList(yuvSize);
 
   final int ySize = width * height;

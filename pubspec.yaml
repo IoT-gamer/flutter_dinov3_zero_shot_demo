@@ -38,6 +38,7 @@ dependencies:
   equatable: ^3.0.0
   ffi: ^2.2.0
   flutter_bloc: ^9.1.1
+  gal: ^2.3.3
   image: ^4.12.0
   image_picker: ^1.2.4
   integral_isolates: ^0.5.1

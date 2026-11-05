@@ -504,6 +504,7 @@ float* create_prototype_from_box(
     float ymax,
     float xmax,
     int input_size,
+    const char* out_cutout_png_path,
     int* out_feature_dim
 ) {
     if (!g_dinov3_session || !yuv_data) {
@@ -537,6 +538,27 @@ float* create_prototype_from_box(
     int fg_count = 0;
 
     if (!sam_mask_256.empty()) {
+        // Save full-resolution 4-channel transparent RGBA PNG if path is provided
+        if (out_cutout_png_path != nullptr && std::strlen(out_cutout_png_path) > 0) {
+            cv::Mat full_res_mask;
+            // Use INTER_NEAREST so the alpha mask matches the binary threshold used in create_prototype
+            cv::resize(sam_mask_256, full_res_mask, rotated.size(), 0, 0, cv::INTER_NEAREST);
+
+            // Convert RGB to BGR for OpenCV PNG encoding
+            // Keep full scene BGR intact (only Alpha = 0 hides the background visually)
+            // so re-importing via create_prototype preserves ViT global self-attention context!
+            cv::Mat bgr;
+            cv::cvtColor(rotated, bgr, cv::COLOR_RGB2BGR);
+
+            std::vector<cv::Mat> bgra_channels;
+            cv::split(bgr, bgra_channels);
+            bgra_channels.push_back(full_res_mask); // Alpha channel (0 = transparent, 255 = opaque)
+
+            cv::Mat bgra;
+            cv::merge(bgra_channels, bgra);
+            cv::imwrite(out_cutout_png_path, bgra);
+        }
+
         // Downscale 256x256 EdgeTAM mask to DINOv3 patch grid (w_patches x h_patches)
         cv::Mat patch_mask;
         cv::resize(sam_mask_256, patch_mask, cv::Size(w_patches, h_patches), 0, 0, cv::INTER_NEAREST);

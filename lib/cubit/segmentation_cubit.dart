@@ -8,6 +8,7 @@ import 'package:camera/camera.dart';
 import 'package:equatable/equatable.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:gal/gal.dart';
 import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:integral_isolates/integral_isolates.dart';
@@ -29,6 +30,8 @@ class SegmentationCubit extends Cubit<SegmentationState> {
 
   // Cached latest camera frame for zero-shot Gemma 4 grounding
   List<Uint8List>? _latestPlanes;
+  List<int>? _latestBytesPerRow;
+  List<int?>? _latestBytesPerPixel;
   int _latestWidth = 0;
   int _latestHeight = 0;
 
@@ -206,9 +209,12 @@ class SegmentationCubit extends Cubit<SegmentationState> {
 
     try {
       // Snapshot the exact camera frame at the moment of the voice/text request
+
       final frozenPlanes = _latestPlanes!
           .map((plane) => Uint8List.fromList(plane))
           .toList();
+      final frozenBytesPerRow = List<int>.from(_latestBytesPerRow!);
+      final frozenBytesPerPixel = List<int?>.from(_latestBytesPerPixel!);
       final frozenW = _latestWidth;
       final frozenH = _latestHeight;
 
@@ -218,6 +224,8 @@ class SegmentationCubit extends Cubit<SegmentationState> {
       // Rotate & resize YUV420 to JPEG in C++ (700px = 280 Gemma Token Budget)
       final saved = await _isolate.compute(saveFrameForGemma, {
         'planes': frozenPlanes,
+        'bytesPerRow': frozenBytesPerRow,
+        'bytesPerPixel': frozenBytesPerPixel,
         'width': frozenW,
         'height': frozenH,
         'maxDim': 700,
@@ -240,21 +248,28 @@ class SegmentationCubit extends Cubit<SegmentationState> {
         throw Exception('Object not found (Gemma returned: "$rawResponse")');
       }
 
+      final cutoutPath = p.join(tempDir.path, 'latest_edgetam_cutout.png');
+
       // Extract DINOv3 prototype using Center-Seeded Refinement on the same frame
       final prototype = await _isolate.compute(createPrototypeFromBox, {
         'planes': frozenPlanes,
+        'bytesPerRow': frozenBytesPerRow,
+        'bytesPerPixel': frozenBytesPerPixel,
         'width': frozenW,
         'height': frozenH,
         'box': box,
         'inputSize': state.selectedInputSize,
+        'cutoutPath': cutoutPath,
       });
 
       if (prototype.isNotEmpty) {
+        final hasCutout = await File(cutoutPath).exists();
         emit(
           state.copyWith(
             status: SegmentationStatus.prototypeReady,
             objectPrototype: prototype,
             detectedBox: box,
+            cutoutPngPath: hasCutout ? cutoutPath : null,
             isSegmenting: true, // Automatically begin real-time tracking
           ),
         );
@@ -290,10 +305,15 @@ class SegmentationCubit extends Cubit<SegmentationState> {
   }
 
   void processCameraImage(CameraImage cameraImage) {
-    // Always keep a lightweight reference to the latest YUV420 planes for enrollment
     if (cameraImage.format.group == ImageFormatGroup.yuv420 &&
         state.status != SegmentationStatus.creatingPrototype) {
       _latestPlanes = cameraImage.planes.map((p) => p.bytes).toList();
+      _latestBytesPerRow = cameraImage.planes
+          .map((p) => p.bytesPerRow)
+          .toList();
+      _latestBytesPerPixel = cameraImage.planes
+          .map((p) => p.bytesPerPixel)
+          .toList();
       _latestWidth = cameraImage.width;
       _latestHeight = cameraImage.height;
     }
@@ -310,6 +330,10 @@ class SegmentationCubit extends Cubit<SegmentationState> {
         .compute(runSegmentation, {
           'prototype': state.objectPrototype!,
           'planes': cameraImage.planes.map((p) => p.bytes).toList(),
+          'bytesPerRow': cameraImage.planes.map((p) => p.bytesPerRow).toList(),
+          'bytesPerPixel': cameraImage.planes
+              .map((p) => p.bytesPerPixel)
+              .toList(),
           'width': cameraImage.width,
           'height': cameraImage.height,
           'format': cameraImage.format.group,
@@ -379,6 +403,66 @@ class SegmentationCubit extends Cubit<SegmentationState> {
       emit(state.copyWith(showLargestAreaOnly: !state.showLargestAreaOnly));
   void toggleSliderVisibility() =>
       emit(state.copyWith(showSlider: !state.showSlider));
+
+  Future<bool> exportCutoutToGallery() async {
+    final path = state.cutoutPngPath;
+    if (path == null || state.isSavingCutout) return false;
+
+    final sourceFile = File(path);
+    if (!await sourceFile.exists()) return false;
+
+    emit(state.copyWith(isSavingCutout: true));
+
+    try {
+      final hasAccess = await Gal.hasAccess();
+      if (!hasAccess) {
+        final granted = await Gal.requestAccess();
+        if (!granted) {
+          emit(
+            state.copyWith(
+              isSavingCutout: false,
+              status: SegmentationStatus.error,
+              errorMessage:
+                  'Storage permission is required to save cutout PNG.',
+            ),
+          );
+          emit(
+            state.copyWith(
+              status: SegmentationStatus.prototypeReady,
+              errorMessage: null,
+            ),
+          );
+          return false;
+        }
+      }
+
+      final tempDir = await getTemporaryDirectory();
+      final exportPath = p.join(
+        tempDir.path,
+        'segmented_${DateTime.now().millisecondsSinceEpoch}.png',
+      );
+      await sourceFile.copy(exportPath);
+      await Gal.putImage(exportPath);
+
+      emit(state.copyWith(isSavingCutout: false));
+      return true;
+    } catch (e) {
+      emit(
+        state.copyWith(
+          isSavingCutout: false,
+          status: SegmentationStatus.error,
+          errorMessage: 'Failed to save RGBA cutout: $e',
+        ),
+      );
+      emit(
+        state.copyWith(
+          status: SegmentationStatus.prototypeReady,
+          errorMessage: null,
+        ),
+      );
+      return false;
+    }
+  }
 
   @override
   Future<void> close() {

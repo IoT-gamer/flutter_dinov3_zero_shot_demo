@@ -434,6 +434,39 @@ class _CameraViewState extends State<CameraView> {
                     : Colors.grey,
                 child: const Icon(Icons.filter_center_focus),
               ),
+              if (state.cutoutPngPath != null) ...[
+                FloatingActionButton(
+                  heroTag: 'btn_save_cutout',
+                  onPressed: (isCreatingPrototype || state.isSavingCutout)
+                      ? null
+                      : () async {
+                          final saved = await cubit.exportCutoutToGallery();
+                          if (context.mounted && saved) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text(
+                                  '💾 Transparent RGBA PNG saved to Gallery!',
+                                ),
+                                duration: Duration(seconds: 2),
+                              ),
+                            );
+                          }
+                        },
+                  tooltip: 'Export EdgeTAM Cutout as RGBA PNG',
+                  backgroundColor: Colors.teal,
+                  child: state.isSavingCutout
+                      ? const SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Colors.white,
+                          ),
+                        )
+                      : const Icon(Icons.save_alt, color: Colors.white),
+                ),
+                const SizedBox(height: 16),
+              ],
             ],
           ),
         );

@@ -15,7 +15,9 @@ class SegmentationState extends Equatable {
     this.status = SegmentationStatus.initial,
     this.objectPrototype,
     this.overlayImage,
-    this.detectedBox, // <-- Added: [ymin, xmin, ymax, xmax] in [0.0, 1.0]
+    this.detectedBox,
+    this.cutoutPngPath,
+    this.isSavingCutout = false,
     this.isSegmenting = false,
     this.similarityThreshold = 0.8,
     this.selectedInputSize = 320,
@@ -28,6 +30,8 @@ class SegmentationState extends Equatable {
   final List<double>? objectPrototype;
   final ui.Image? overlayImage;
   final List<double>? detectedBox;
+  final String? cutoutPngPath;
+  final bool isSavingCutout;
   final bool isSegmenting;
   final double similarityThreshold;
   final int selectedInputSize;
@@ -40,6 +44,8 @@ class SegmentationState extends Equatable {
     List<double>? objectPrototype,
     ui.Image? overlayImage,
     List<double>? detectedBox,
+    String? cutoutPngPath,
+    bool? isSavingCutout,
     bool? isSegmenting,
     double? similarityThreshold,
     int? selectedInputSize,
@@ -49,6 +55,7 @@ class SegmentationState extends Equatable {
     bool clearPrototype = false,
     bool clearOverlay = false,
     bool clearBox = false,
+    bool clearCutout = false,
   }) {
     return SegmentationState(
       status: status ?? this.status,
@@ -57,6 +64,8 @@ class SegmentationState extends Equatable {
           : objectPrototype ?? this.objectPrototype,
       overlayImage: clearOverlay ? null : overlayImage ?? this.overlayImage,
       detectedBox: clearBox ? null : detectedBox ?? this.detectedBox,
+      cutoutPngPath: clearCutout ? null : cutoutPngPath ?? this.cutoutPngPath,
+      isSavingCutout: isSavingCutout ?? this.isSavingCutout,
       isSegmenting: isSegmenting ?? this.isSegmenting,
       similarityThreshold: similarityThreshold ?? this.similarityThreshold,
       selectedInputSize: selectedInputSize ?? this.selectedInputSize,
@@ -72,6 +81,8 @@ class SegmentationState extends Equatable {
     objectPrototype,
     overlayImage,
     detectedBox,
+    cutoutPngPath,
+    isSavingCutout,
     isSegmenting,
     similarityThreshold,
     selectedInputSize,
